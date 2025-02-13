@@ -167,3 +167,4 @@ train.py
 *.pkl
 *.pth
 /wandb/*
+/pretrained_weights/*

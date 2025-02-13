@@ -18,12 +18,156 @@ from src.modules.dit_talking_head import DitTalkingHead
 from logger import logger
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+import wandb
+import torch
+import matplotlib.pyplot as plt
+import io
+from PIL import Image
+import numpy as np
+from pathlib import Path
+import torchvision.transforms as transforms
+from collections import defaultdict
+
+class ExpressionTrainingMonitor:
+    def __init__(self, save_dir="visualizations", log_freq=50):
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.log_freq = log_freq
+        self.metrics = defaultdict(list)
+        
+    def log_step(self, global_step, loss_dict, optimizer, prediction, target):
+        """Log training metrics for current step"""
+        if global_step % self.log_freq != 0:
+            return
+            
+        # Log losses
+        wandb_metrics = {
+            'train/total_loss': loss_dict['loss'].item(),
+            'train/noise_loss': loss_dict['noise'].item(),
+            'train/exp_loss': loss_dict['exp'].item() if 'exp' in loss_dict else 0,
+            'train/exp_vel_loss': loss_dict['exp_vel'].item() if 'exp_vel' in loss_dict else 0,
+            'train/exp_smooth_loss': loss_dict['exp_smooth'].item() if 'exp_smooth' in loss_dict else 0,
+            'train/head_angle_loss': loss_dict['head_angle'].item() if 'head_angle' in loss_dict else 0,
+            'train/head_vel_loss': loss_dict['head_vel'].item() if 'head_vel' in loss_dict else 0,
+            'step': global_step
+        }
+        
+        # Log learning rates for each parameter group
+        for i, param_group in enumerate(optimizer.param_groups):
+            group_name = param_group.get('name', f'group_{i}')
+            wandb_metrics[f'lr/{group_name}'] = param_group['lr']
+            
+        # Generate expression comparison visualization
+        if prediction is not None and target is not None:
+            vis_dict = self.create_expression_visualizations(prediction, target, global_step)
+            wandb_metrics.update(vis_dict)
+            
+        # Log metrics
+        wandb.log(wandb_metrics)
+        
+        # Store metrics history
+        for k, v in wandb_metrics.items():
+            if isinstance(v, (int, float)):
+                self.metrics[k].append((global_step, v))
+
+    def create_expression_visualizations(self, prediction, target, step):
+        """Create visualizations comparing predicted and target expressions"""
+        try:
+            # Take first batch item for visualization
+            pred = prediction[0].detach().cpu()
+            tgt = target[0].detach().cpu()
+            
+            # Create heatmap comparison
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12))
+            
+            # Plot target expression
+            im1 = ax1.imshow(tgt.T, aspect='auto', cmap='RdBu_r', vmin=-3, vmax=3)
+            ax1.set_title('Target Expression Sequence')
+            plt.colorbar(im1, ax=ax1)
+            
+            # Plot predicted expression
+            im2 = ax2.imshow(pred.T, aspect='auto', cmap='RdBu_r', vmin=-3, vmax=3)
+            ax2.set_title('Predicted Expression Sequence')
+            plt.colorbar(im2, ax=ax2)
+            
+            # Plot difference
+            diff = pred - tgt
+            im3 = ax3.imshow(diff.T, aspect='auto', cmap='RdBu_r')
+            ax3.set_title('Difference (Prediction - Target)')
+            plt.colorbar(im3, ax=ax3)
+            
+            plt.tight_layout()
+            
+            # Save image
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            plt.close()
+            buf.seek(0)
+            
+            # Convert to wandb image
+            image = wandb.Image(Image.open(buf))
+            
+            # Compute statistics
+            similarity = 1 - torch.abs(diff).mean()
+            max_diff = torch.abs(diff).max()
+            
+            return {
+                'visualizations/expression_comparison': image,
+                'metrics/expression_similarity': similarity.item(),
+                'metrics/max_difference': max_diff.item()
+            }
+            
+        except Exception as e:
+            print(f"Error creating visualizations: {str(e)}")
+            return {}
+
+    def log_validation(self, val_metrics, epoch):
+        """Log validation metrics"""
+        wandb_metrics = {
+            'val/total_loss': val_metrics['total'],
+            'val/noise_loss': val_metrics.get('noise', 0),
+            'val/exp_loss': val_metrics.get('exp', 0),
+            'val/exp_vel_loss': val_metrics.get('exp_vel', 0),
+            'val/head_angle_loss': val_metrics.get('head_angle', 0),
+            'epoch': epoch
+        }
+        wandb.log(wandb_metrics)
+
+    def get_metric_history(self, metric_name):
+        """Get history of a specific metric"""
+        return self.metrics.get(metric_name, [])
+
+    def plot_metric_history(self, metric_name):
+        """Plot history of a specific metric"""
+        history = self.get_metric_history(metric_name)
+        if not history:
+            return None
+            
+        steps, values = zip(*history)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(steps, values)
+        ax.set_title(f'{metric_name} History')
+        ax.set_xlabel('Step')
+        ax.set_ylabel(metric_name)
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close()
+        buf.seek(0)
+        
+        return wandb.Image(Image.open(buf))
+    
 def train(args, model, train_loader, val_loader, optimizer, save_dir, scheduler=None, writer=None, ):
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # model
     device = model.device
     model.train()
+
+    monitor = ExpressionTrainingMonitor(
+        save_dir=save_dir / "visualizations",
+        log_freq=args.log_iter
+    )
 
     # data
     data_loader = infinite_data_loader(train_loader)
@@ -114,9 +258,28 @@ def train(args, model, train_loader, val_loader, optimizer, save_dir, scheduler=
             else:
                 noise, target, _, _ = model(motion_coef_in, audio_in, prev_motion_coef, prev_audio_feat, indicator=indicator)
 
+            # Monitor expressions 
+            monitor.log_step(
+                global_step=it,
+                loss_dict={
+                    'loss': loss,
+                    'noise': loss_noise,
+                    'exp': loss_exp,
+                    'exp_vel': loss_exp_v,
+                    'exp_smooth': loss_exp_s,
+                    'head_angle': loss_head_angle,
+                    'head_vel': loss_head_vel,
+                    'head_smooth': loss_head_smooth,
+                    'head_trans': loss_head_trans
+                },
+                optimizer=optimizer,
+                prediction=noise,
+                target=target
+            )
 
-            visualize_expression_comparison(target, noise, iteration=it)
-            visualize_expression_sequence_comparison(target, noise, n_frames=5, iteration=it)
+
+            # visualize_expression_comparison(target, noise, iteration=it)
+            # visualize_expression_sequence_comparison(target, noise, n_frames=5, iteration=it)
       
             loss_n, loss_exp, loss_exp_v, loss_exp_s, loss_ha, loss_hc, loss_hs, loss_ht = utils.compute_loss_new(args, i == 0, motion_coef_in, noise, target, prev_motion_coef, end_idx)
             loss_noise = loss_noise + loss_n / 2
@@ -560,6 +723,12 @@ def count_parameters(model):
 
 def main(args, option_text=None):
     # model
+    wandb.init(
+        project="JoyVASA",
+        name=args.exp_name,
+        config=vars(args)
+    )
+        
     model_kwargs = dict(
         device = device,
         target = args.target,
