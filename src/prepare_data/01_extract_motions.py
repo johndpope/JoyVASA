@@ -8,7 +8,7 @@ sys.path.append(os.path.dirname(os.path.abspath("../")))
 
 from src.config.argument_config import ArgumentConfig
 from src.motion_extractor import make_motion_templete
-
+from logger import logger
 
 def extract_audio(video_path):
     """Extract audio from video file as WAV with 16kHz sampling rate"""
