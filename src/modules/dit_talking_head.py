@@ -7,22 +7,8 @@ from .common import PositionalEncoding, enc_dec_mask, pad_audio
 from ..config.base_config import make_abs_path
 import math
 from logger import logger
-import numpy as np
 
 
-def format_shape_info(self, x):
-    """Helper to safely get shape info for different types."""
-    if torch.is_tensor(x):
-        return f"{x.shape} (tensor)"
-    elif isinstance(x, list):
-        return f"list of len {len(x)}"
-    elif isinstance(x, np.ndarray):
-        return f"{x.shape} (numpy)"
-    else:
-        return f"type: {type(x)}"
-        
-
-        
 class DiffusionSchedule(nn.Module):
     def __init__(self, num_steps, mode='linear', beta_1=1e-4, beta_T=0.02, s=0.008):
         super().__init__()
@@ -73,367 +59,287 @@ class DiffusionSchedule(nn.Module):
         return sigmas
 
 
-class DeformableExpressionAttention(nn.Module):
-    def __init__(self, dim, n_heads=8, n_points=4):
+class LSHTransformerDecoder(nn.Module):
+    def __init__(self, decoder_layer, num_layers):
         super().__init__()
-        self.n_heads = n_heads
-        self.n_points = n_points
-        self.dim_per_head = dim // n_heads
+        self.layers = nn.ModuleList([decoder_layer for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(decoder_layer.linear1.in_features)
+        self.num_layers = num_layers
         
-        # Value projection
-        self.value_proj = nn.Linear(dim, dim)
-        self.output_proj = nn.Linear(dim, dim)
+        logger.debug(f"Initializing LSH Transformer Decoder with {num_layers} layers")
+        logger.debug(f"Layer normalization dimension: {decoder_layer.linear1.in_features}")
+    
+    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None):
+        """
+        Args:
+            tgt: Target sequence (N, L, d_model)
+            memory: Memory from encoder (N, S, d_model)
+            tgt_mask: Target sequence mask (optional)
+            memory_mask: Memory mask (optional)
+        """
+        output = tgt
         
-        # Query/Key transformations
-        self.qk_proj = nn.Linear(dim, dim * 2)
-        
-        # Reference point prediction
-        self.sampling_offsets = nn.Linear(dim, n_heads * n_points * 2)
-        
-        # Attention weights
-        self.attention_weights = nn.Linear(dim, n_heads * n_points)
-        
-        self._reset_parameters()
+        logger.debug(f"\nLSH Transformer Decoder Forward Pass")
+        logger.debug(f"Input shapes - tgt: {tgt.shape}, memory: {memory.shape}")
+        if tgt_mask is not None:
+            logger.debug(f"Target mask shape: {tgt_mask.shape}")
+        if memory_mask is not None:
+            logger.debug(f"Memory mask shape: {memory_mask.shape}")
 
-    def log_tensor_stats(self, name, tensor):
-        """Helper to log tensor statistics."""
-        if torch.is_tensor(tensor):
-            logger.debug(f"  {name}:")
-            logger.debug(f"    shape: {tensor.shape}")
-            logger.debug(f"    mean: {tensor.float().mean():.4f}")
-            logger.debug(f"    std: {tensor.float().std():.4f}")
-            logger.debug(f"    min: {tensor.float().min():.4f}")
-            logger.debug(f"    max: {tensor.float().max():.4f}")
-    
-    def _reset_parameters(self):
-        nn.init.xavier_uniform_(self.qk_proj.weight)
-        nn.init.zeros_(self.qk_proj.bias)
-        
-        nn.init.xavier_uniform_(self.value_proj.weight)
-        nn.init.zeros_(self.value_proj.bias)
-        
-        nn.init.xavier_uniform_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
-        
-        # Initialize sampling offsets
-        nn.init.constant_(self.sampling_offsets.weight, 0.0)
-        thetas = torch.arange(self.n_heads, dtype=torch.float32) * (2.0 * math.pi / self.n_heads)
-        grid_init = torch.stack([torch.cos(thetas), torch.sin(thetas)], -1)
-        grid_init = grid_init / grid_init.abs().max(-1, keepdim=True)[0]
-        grid_init = grid_init.view(self.n_heads, 1, 2).repeat(1, self.n_points, 1)
-        for i in range(self.n_points):
-            grid_init[:, i, :] *= 0.5 * (i + 1) / self.n_points
-        self.sampling_offsets.bias = nn.Parameter(grid_init.view(-1))
-        
-        # Initialize attention weights
-        nn.init.constant_(self.attention_weights.weight, 0.0)
-        nn.init.constant_(self.attention_weights.bias, 0.0)
-        
-    def forward(self, query, key, value, pos=None, attn_mask=None):
-        """
-        Args:
-            query: (B, L, D)
-            key: (B, L, D)
-            value: (B, L, D)
-            pos: Optional positional encoding (B, L, D)
-            attn_mask: Optional attention mask (L, L) or (B, L, L)
-        """
-        logger.debug("\n=== DeformableExpressionAttention Forward Pass ===")
-        
-        batch_size, seq_len, _ = value.shape
-        logger.debug(f"Batch size: {batch_size}, Sequence length: {seq_len}")
-        
-        # Add positional encodings if provided
-        if pos is not None:
-            query = query + pos
-            key = key + pos
+        # Debug tensor statistics
+        with torch.no_grad():
+            logger.debug(f"Input statistics:")
+            logger.debug(f"  tgt - mean: {tgt.mean():.4f}, std: {tgt.std():.4f}")
+            logger.debug(f"  memory - mean: {memory.mean():.4f}, std: {memory.std():.4f}")
             
-        # Project queries and keys
-        logger.debug("\nProjecting queries and keys...")
-        qk = self.qk_proj(query).chunk(2, dim=-1)
-        q, k = qk[0], qk[1]
-        
-        # Project values
-        logger.debug("\nProjecting values...")
-        v = self.value_proj(value)
-        
-        # Generate reference points (normalized positions)
-        ref_y = torch.linspace(0, 1, seq_len, device=query.device)
-        ref_x = torch.linspace(0, 1, seq_len, device=query.device)
-        ref_y, ref_x = torch.meshgrid(ref_y, ref_x, indexing='ij')
-        reference_points = torch.stack([ref_x, ref_y], dim=-1)  # [L, L, 2]
-        
-        # Expand reference points for batch and heads
-        reference_points = reference_points.unsqueeze(0).unsqueeze(2)  # [1, L, 1, L, 2]
-        reference_points = reference_points.expand(batch_size, -1, self.n_heads, -1, -1)  # [B, L, H, L, 2]
-        
-        logger.debug(f"Reference points shape: {reference_points.shape}")
-        self.log_tensor_stats("Reference points", reference_points)
-        
-        # Predict sampling offsets and attention weights
-        logger.debug("\nPredicting sampling offsets and attention weights...")
-        sampling_offsets = self.sampling_offsets(query).view(
-            batch_size, seq_len, self.n_heads, self.n_points, 2
-        )
-        attention_weights = self.attention_weights(query).view(
-            batch_size, seq_len, self.n_heads, self.n_points
-        )
-        
-        # Apply attention mask if provided
-        if attn_mask is not None:
-            logger.debug("\nApplying attention mask...")
-            # Convert mask to boolean if it's not already
-            if not attn_mask.dtype == torch.bool:
-                attn_mask = attn_mask.to(torch.bool)
+        # Process through decoder layers
+        for idx, layer in enumerate(self.layers):
+            logger.debug(f"\nProcessing decoder layer {idx + 1}/{self.num_layers}")
             
-            if attn_mask.dim() == 2:
-                attn_mask = attn_mask.unsqueeze(0)  # [1, L, L]
-                
-            # Log original mask shape
-            logger.debug(f"Original mask shape: {attn_mask.shape}")
+            # Record statistics before layer
+            with torch.no_grad():
+                pre_mean = output.mean().item()
+                pre_std = output.std().item()
             
-            # Reshape mask to [B, L, 1, 1]
-            attn_mask = attn_mask.unsqueeze(2).unsqueeze(3)  # [B, L, 1, 1]
-            logger.debug(f"Reshaped mask shape: {attn_mask.shape}")
+            # Forward pass through layer
+            output = layer(output, memory, tgt_mask, memory_mask)
             
-            # Create a broadcasting mask for the attention weights
-            # attention_weights shape: [B, L, H, P]
-            # Expand mask to [B, L, H, P]
-            expanded_mask = attn_mask.expand(batch_size, seq_len, self.n_heads, self.n_points)
-            logger.debug(f"Expanded mask shape: {expanded_mask.shape}")
-            logger.debug(f"Attention weights shape before masking: {attention_weights.shape}")
+            # Record statistics after layer
+            with torch.no_grad():
+                post_mean = output.mean().item()
+                post_std = output.std().item()
+                logger.debug(f"Layer {idx + 1} statistics:")
+                logger.debug(f"  Pre  - mean: {pre_mean:.4f}, std: {pre_std:.4f}")
+                logger.debug(f"  Post - mean: {post_mean:.4f}, std: {post_std:.4f}")
             
-            # Apply the mask
-            mask_value = float('-inf')
-            attention_weights = torch.where(expanded_mask, attention_weights, torch.tensor(mask_value, device=attention_weights.device))
+            # Check for NaN/Inf values
+            if torch.isnan(output).any():
+                logger.error(f"NaN detected in output of layer {idx + 1}")
+            if torch.isinf(output).any():
+                logger.error(f"Inf detected in output of layer {idx + 1}")
+
+        # Final normalization
+        output = self.norm(output)
         
-        attention_weights = F.softmax(attention_weights, dim=-1)
-        
-        logger.debug(f"Sampling offsets shape: {sampling_offsets.shape}")
-        logger.debug(f"Attention weights shape after softmax: {attention_weights.shape}")
-        
-        # Calculate sampling locations with proper broadcasting
-        logger.debug("\nCalculating sampling locations...")
-        sampling_locations = (
-            reference_points[:, :, :, :1, :] + 
-            sampling_offsets
-        )
-        sampling_locations = sampling_locations.clamp(0, 1)
-        
-        logger.debug(f"Sampling locations shape: {sampling_locations.shape}")
-        self.log_tensor_stats("Sampling locations", sampling_locations)
-        
-        # Sample features
-        logger.debug("\nPreparing for feature sampling...")
-        v = v.view(batch_size, seq_len, self.n_heads, self.dim_per_head)
-        v = v.permute(0, 2, 3, 1).contiguous()  # [B, H, D/H, L]
-        
-        # Reshape for grid_sample
-        v = v.view(batch_size * self.n_heads, self.dim_per_head, 1, seq_len)
-        sampling_locs = sampling_locations.view(
-            batch_size * self.n_heads, seq_len, self.n_points, 2
-        )
-        
-        # Sample features
-        logger.debug("\nPerforming grid sampling...")
-        sampled_feats = F.grid_sample(
-            v, sampling_locs,
-            mode='bilinear', padding_mode='zeros', align_corners=False
-        )
-        
-        # Reshape sampled features to match attention weights
-        sampled_feats = sampled_feats.view(
-            batch_size, self.n_heads, self.dim_per_head, seq_len, self.n_points
-        )
-        
-        # Reshape attention weights for broadcasting
-        attention_weights = attention_weights.permute(0, 2, 1, 3)  # [B, H, L, P]
-        attention_weights = attention_weights.unsqueeze(2)  # [B, H, 1, L, P]
-        
-        logger.debug(f"Final sampled features shape: {sampled_feats.shape}")
-        logger.debug(f"Final attention weights shape: {attention_weights.shape}")
-        
-        # Apply attention weights
-        output = (sampled_feats * attention_weights).sum(-1)  # [B, H, D/H, L]
-        
-        # Final reshaping and projection
-        output = output.permute(0, 3, 1, 2).contiguous()  # [B, L, H, D/H]
-        output = output.view(batch_size, seq_len, -1)
-        output = self.output_proj(output)
-        
-        logger.debug(f"Final output shape: {output.shape}")
-        self.log_tensor_stats("Final output", output)
-        
-        return output 
-    
-class DeformableExpressionTransformer(nn.Module):
-    def __init__(
-        self,
-        d_model=256,
-        n_heads=8,
-        n_points=4,
-        n_layers=6,
-        dim_feedforward=1024,
-        dropout=0.1,
-        n_prev_motions=25,
-        n_motions=100
-    ):
-        super().__init__()
-        
-        self.n_prev_motions = n_prev_motions
-        self.n_motions = n_motions
-        self.total_length = n_prev_motions + n_motions
-        
-        # Input projections
-        self.exp_input_proj = nn.Linear(d_model, d_model)
-        
-        # Position encodings
-        self.pos_encoding = nn.Parameter(torch.zeros(1, self.total_length, d_model))
-        self.memory_pos = nn.Parameter(torch.zeros(1, self.total_length, d_model))
-        
-        # Initialize position encodings
-        self._init_position_encodings()
-        
-        # Transformer layers
-        self.layers = nn.ModuleList([
-            DeformableExpressionTransformerLayer(
-                d_model=d_model,
-                n_heads=n_heads,
-                n_points=n_points,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout
-            ) for _ in range(n_layers)
-        ])
-        
-        # Output projection
-        self.output_proj = nn.Linear(d_model, d_model)
-        
-    def _init_position_encodings(self):
-        """Initialize position encodings with sinusoidal values"""
-        position = torch.arange(self.total_length, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, self.pos_encoding.shape[-1], 2) * (-math.log(10000.0) / self.pos_encoding.shape[-1]))
-        
-        self.pos_encoding.data[0, :, 0::2] = torch.sin(position * div_term)
-        self.pos_encoding.data[0, :, 1::2] = torch.cos(position * div_term)
-        self.memory_pos.data = self.pos_encoding.data.clone()
-        
-    def forward(self, x, memory, memory_mask=None):
-        """
-        Args:
-            x: Input tensor (batch_size, seq_len, d_model)
-            memory: Memory tensor from encoder (batch_size, seq_len, d_model)
-            memory_mask: Optional attention mask
-        """
-        batch_size = x.shape[0]
-        seq_len = x.shape[1]
-        
-        if seq_len != self.total_length:
-            raise ValueError(f"Expected sequence length {self.total_length} but got {seq_len}")
+        # Final output statistics
+        with torch.no_grad():
+            logger.debug(f"\nFinal output statistics:")
+            logger.debug(f"  Shape: {output.shape}")
+            logger.debug(f"  Mean: {output.mean():.4f}")
+            logger.debug(f"  Std: {output.std():.4f}")
+            logger.debug(f"  Min: {output.min():.4f}")
+            logger.debug(f"  Max: {output.max():.4f}")
             
-        # Project input
-        x = self.exp_input_proj(x)
-        
-        # Process through transformer layers
-        attentions = []
-        for layer in self.layers:
-            layer_out = layer(
-                x, memory,
-                pos=self.pos_encoding,
-                memory_pos=self.memory_pos,
-                mask=memory_mask
-            )
-            x = layer_out[0] if isinstance(layer_out, tuple) else layer_out
-            if isinstance(layer_out, tuple) and len(layer_out) > 1:
-                attentions.append(layer_out[1])
-        
-        # Project to output dimension
-        output = self.output_proj(x)
-        
-        if attentions:
-            return output, attentions
         return output
-    
-class DeformableExpressionTransformerLayer(nn.Module):
-    def __init__(self, d_model, n_heads, n_points, dim_feedforward, dropout):
+        
+    def debug_attention_patterns(self, attn_weights):
+        """Debug helper to analyze attention patterns"""
+        with torch.no_grad():
+            # Average attention weights across heads
+            avg_attn = attn_weights.mean(dim=1)  # Average across heads
+            
+            logger.debug(f"\nAttention Pattern Analysis:")
+            logger.debug(f"  Shape: {attn_weights.shape}")
+            logger.debug(f"  Mean attention weight: {avg_attn.mean():.4f}")
+            logger.debug(f"  Max attention weight: {avg_attn.max():.4f}")
+            
+            # Check for attention concentration
+            top_k = 5
+            values, _ = torch.topk(avg_attn.flatten(), top_k)
+            logger.debug(f"  Top {top_k} attention weights: {values.tolist()}")
+            
+            # Check for uniform attention
+            uniformity = -(avg_attn * torch.log(avg_attn + 1e-9)).sum(dim=-1).mean()
+            logger.debug(f"  Attention uniformity (entropy): {uniformity:.4f}")
+
+
+import math
+
+class LSHAttention(nn.Module):
+    def __init__(self, feature_dim, n_heads=8, n_hashes=4, bucket_size=64):
         super().__init__()
+        self.feature_dim = feature_dim
+        self.n_heads = n_heads
+        self.n_hashes = n_hashes
+        self.bucket_size = bucket_size
+        self.head_dim = feature_dim // n_heads
         
-        # Self attention
-        self.self_attn = DeformableExpressionAttention(
-            dim=d_model,
-            n_heads=n_heads,
-            n_points=n_points
-        )
+        logger.debug(f"Initializing LSH Attention with dims: feature={feature_dim}, heads={n_heads}, head_dim={self.head_dim}")
         
-        # Cross attention
-        self.cross_attn = DeformableExpressionAttention(
-            dim=d_model,
-            n_heads=n_heads,
-            n_points=n_points
-        )
+        self.qk_proj = nn.Linear(feature_dim, feature_dim * 2)
+        self.v_proj = nn.Linear(feature_dim, feature_dim)
+        self.out_proj = nn.Linear(feature_dim, feature_dim)
         
-        # FFN and norms remain the same
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model)
-        )
+        # Random rotation matrix for LSH
+        self.register_buffer('random_rotations', 
+            torch.randn(n_heads, n_hashes, self.head_dim, device='cuda') * 0.02)
+
+    def hash_vectors(self, vectors):
+        """Hash vectors to buckets using random rotations"""
+        # vectors: [batch, seq_len, n_heads, head_dim]
+        logger.debug(f"Hashing vectors shape: {vectors.shape}")
+        logger.debug(f"Random rotations shape: {self.random_rotations.shape}")
+        
+        # Reshape for batch and heads
+        B, L, H, D = vectors.shape
+        vectors = vectors.permute(0, 2, 1, 3)  # [B, H, L, D]
+        
+        # Multiply by random rotations
+        rotated = torch.einsum('bhld,hrd->bhlr', vectors, self.random_rotations)
+        logger.debug(f"Rotated vectors shape: {rotated.shape}")
+        
+        # Convert to buckets
+        buckets = torch.argmax(torch.cat([rotated, -rotated], dim=-1), dim=-1)  # [B, H, L]
+        logger.debug(f"Buckets shape: {buckets.shape}")
+        
+        return buckets
+
+    def sort_by_buckets(self, buckets, *tensors):
+        """Sort tensors according to bucket assignments"""
+        B, H, L = buckets.shape  # [batch_size, n_heads, seq_len]
+        logger.debug(f"Sort by buckets - buckets shape: {buckets.shape}")
+        
+        for i, tensor in enumerate(tensors):
+            logger.debug(f"Sort by buckets - tensor {i} shape: {tensor.shape}")
+        
+        # Get indices for sorting
+        indices = buckets.argsort(dim=-1)  # [B, H, L]
+        logger.debug(f"Sorted indices shape: {indices.shape}")
+        
+        # Sort all tensors according to bucket ordering
+        sorted_tensors = []
+        for tensor in tensors:
+            # tensor shape: [batch, seq_len, n_heads, head_dim]
+            # Reshape to [batch, n_heads, seq_len, head_dim]
+            tensor = tensor.permute(0, 2, 1, 3)
+            
+            # Gather elements using sorted indices
+            gather_index = indices.unsqueeze(-1).expand(-1, -1, -1, tensor.size(-1))
+            sorted_tensor = torch.gather(tensor, dim=2, index=gather_index)
+            
+            # Reshape back to [batch, seq_len, n_heads, head_dim]
+            sorted_tensor = sorted_tensor.permute(0, 2, 1, 3)
+            logger.debug(f"Sorted tensor shape: {sorted_tensor.shape}")
+            
+            sorted_tensors.append(sorted_tensor)
+            
+        return tuple(sorted_tensors) + (indices,)
+
+    def forward(self, x, mask=None):
+        batch_size, seq_len, _ = x.shape
+        logger.debug(f"\nLSH Attention Forward - Input shape: {x.shape}")
+        if mask is not None:
+            logger.debug(f"Input mask shape: {mask.shape}")
+        
+        # Project queries, keys and values
+        qk = self.qk_proj(x)
+        q, k = qk.chunk(2, dim=-1)
+        v = self.v_proj(x)
+        
+        # Split heads
+        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.n_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.n_heads, self.head_dim)
+        
+        logger.debug(f"After head split - Q shape: {q.shape}")
+        
+        # Compute LSH buckets
+        buckets = self.hash_vectors(q)
+        logger.debug(f"Computed buckets shape: {buckets.shape}")
+        
+        # Sort according to buckets
+        sorted_q, sorted_k, sorted_v, indices = self.sort_by_buckets(buckets, q, k, v)
+        logger.debug(f"After sorting - Q shape: {sorted_q.shape}")
+        
+        # Compute attention scores
+        sorted_q = sorted_q.permute(0, 2, 1, 3)  # [B, H, L, D]
+        sorted_k = sorted_k.permute(0, 2, 1, 3)  # [B, H, L, D]
+        sorted_v = sorted_v.permute(0, 2, 1, 3)  # [B, H, L, D]
+        
+        dots = torch.matmul(sorted_q, sorted_k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        logger.debug(f"Attention scores shape: {dots.shape}")
+        
+        # Handle masking
+        if mask is not None:
+            # Create proper mask for bucketed attention
+            if mask.dim() == 2:
+                # Expand mask to match batch size and heads
+                mask = mask.unsqueeze(0).expand(batch_size, -1, -1)  # [B, L, L]
+                logger.debug(f"Expanded 2D mask shape: {mask.shape}")
+            mask = mask.unsqueeze(1).expand(-1, self.n_heads, -1, -1)  # [B, H, L, L]
+            logger.debug(f"Final mask shape before sorting: {mask.shape}")
+            
+            # Sort mask according to indices
+            indices_expanded_q = indices.unsqueeze(-1).expand(-1, -1, -1, seq_len)
+            indices_expanded_k = indices.unsqueeze(-2).expand(-1, -1, seq_len, -1)
+            
+            # Apply the same sorting to mask rows and columns
+            mask_sorted = mask.gather(2, indices_expanded_q)
+            mask_sorted = mask_sorted.gather(3, indices_expanded_k)
+            logger.debug(f"Sorted mask shape: {mask_sorted.shape}")
+            
+            dots = dots.masked_fill(~mask_sorted, float('-inf'))
+        
+        # Apply softmax
+        attn = F.softmax(dots, dim=-1)
+        logger.debug(f"Attention weights shape: {attn.shape}")
+        
+        # Apply attention to values
+        out = torch.matmul(attn, sorted_v)  # [B, H, L, D]
+        logger.debug(f"After attention shape: {out.shape}")
+        
+        # Restore original ordering
+        restore_indices = indices.argsort(dim=-1)
+        restore_indices = restore_indices.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
+        out = torch.gather(out, dim=2, index=restore_indices)
+        
+        # Reshape to [B, L, H, D]
+        out = out.permute(0, 2, 1, 3)
+        logger.debug(f"After restoring order shape: {out.shape}")
+        
+        # Combine heads
+        out = out.reshape(batch_size, seq_len, self.feature_dim)
+        logger.debug(f"Final output shape: {out.shape}")
+        
+        return self.out_proj(out)
+
+    
+class LSHTransformerDecoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=2048):
+        super().__init__()
+        self.self_attn = LSHAttention(d_model, nhead)
+        self.cross_attn = LSHAttention(d_model, nhead)
+        
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
         
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
         
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(0.1)
+        self.activation = F.gelu
+
+    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None):
+        logger.debug(f"\nLSH Transformer Decoder Layer - Input shapes: tgt={tgt.shape}, memory={memory.shape}")
         
-    def with_pos_embed(self, tensor, pos):
-        return tensor if pos is None else tensor + pos
-        
-    def forward(self, x, memory, pos=None, memory_pos=None, mask=None):
-        """
-        Args:
-            x: Input tensor 
-            memory: Memory tensor for cross attention
-            pos: Position embedding for input
-            memory_pos: Position embedding for memory
-            mask: Attention mask
-        """
         # Self attention
-        residual = x
-        x = self.norm1(x)
-        q = k = self.with_pos_embed(x, pos)
-        self_attn_out = self.self_attn(q, k, x, pos) 
-        x = residual + self.dropout1(self_attn_out)
+        tgt2 = self.self_attn(self.norm1(tgt), mask=tgt_mask)
+        tgt = tgt + self.dropout(tgt2)
+        logger.debug(f"After self attention shape: {tgt.shape}")
         
-        # Cross attention with memory
-        if memory is not None:
-            residual = x
-            x = self.norm2(x)
-            
-            # Apply mask if provided
-            if mask is not None:
-                # Convert boolean mask to float mask
-                attn_mask = torch.zeros_like(mask, dtype=torch.float)
-                attn_mask.masked_fill_(~mask, float('-inf'))
-            else:
-                attn_mask = None
-                
-            cross_attn_out = self.cross_attn(
-                self.with_pos_embed(x, pos),
-                self.with_pos_embed(memory, memory_pos),
-                memory,
-                memory_pos,
-                attn_mask=attn_mask
-            )
-            x = residual + self.dropout2(cross_attn_out)
+        # Cross attention
+        tgt2 = self.cross_attn(self.norm2(tgt), mask=memory_mask)
+        tgt = tgt + self.dropout(tgt2)
+        logger.debug(f"After cross attention shape: {tgt.shape}")
         
-        # Feed forward
-        residual = x
-        x = self.norm3(x)
-        x = residual + self.dropout3(self.ffn(x))
+        # Feedforward
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(self.norm3(tgt)))))
+        tgt = tgt + self.dropout(tgt2)
+        logger.debug(f"After feedforward shape: {tgt.shape}")
         
-        return x, self_attn_out
+        return tgt
+      
 class DitTalkingHead(nn.Module):
     def __init__(self, device='cuda', target="sample", architecture="decoder",
                  motion_feat_dim=76, fps=25, n_motions=100, n_prev_motions=10, 
@@ -463,7 +369,7 @@ class DitTalkingHead(nn.Module):
             self.audio_encoder.feature_extractor._freeze_parameters()
         elif self.audio_model == 'hubert_zh_ori' or self.audio_model == 'hubert_zh': # 根据经验，hubert特征提取器效果更好
             print("using hubert chinese ori")
-            model_path = '../../pretrained_weights/chinese-hubert-base'
+            model_path = '../../pretrained_weights/TencentGameMate:chinese-hubert-base'
             if platform.system() == "Windows":
                 model_path = '../../pretrained_weights/chinese-hubert-base'
             from .hubert import HubertModel
@@ -500,8 +406,6 @@ class DitTalkingHead(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-
-        
     def forward(self, motion_feat, audio_or_feat, prev_motion_feat=None, prev_audio_feat=None, time_step=None, indicator=None):
         """
         Args:
@@ -723,14 +627,12 @@ class DenoisingNetwork(nn.Module):
     def __init__(self, device='cuda', motion_feat_dim=76, 
                  use_indicator=None, architecture="decoder", feature_dim=512, n_heads=8, 
                  n_layers=8, mlp_ratio=4, align_mask_width=1, no_use_learnable_pe=True, n_prev_motions=10,
-                 n_motions=100, n_diff_steps=500, ):
+                 n_motions=100, n_diff_steps=500):
         super().__init__()
 
         # Model parameters
         self.motion_feat_dim = motion_feat_dim 
         self.use_indicator = use_indicator
-
-        # Transformer
         self.architecture = architecture
         self.feature_dim = feature_dim
         self.n_heads = n_heads
@@ -738,12 +640,15 @@ class DenoisingNetwork(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.align_mask_width = align_mask_width
         self.use_learnable_pe = not no_use_learnable_pe
-
-        # sequence length
         self.n_prev_motions = n_prev_motions
         self.n_motions = n_motions
 
-        # Temporal embedding for the diffusion time step
+        # Important: Initialize feature_proj first since it's used in forward
+        if self.architecture == 'decoder':
+            self.feature_proj = nn.Linear(self.motion_feat_dim + (1 if self.use_indicator else 0),
+                                        self.feature_dim)
+
+        # Temporal embedding for diffusion time step
         self.TE = PositionalEncoding(self.feature_dim, max_len=n_diff_steps + 1)
         self.diff_step_map = nn.Sequential(
             nn.Linear(self.feature_dim, self.feature_dim),
@@ -751,45 +656,27 @@ class DenoisingNetwork(nn.Module):
             nn.Linear(self.feature_dim, self.feature_dim)
         )
 
+        # Positional encoding
         if self.use_learnable_pe:
-            # Learnable positional encoding
             self.PE = nn.Parameter(torch.randn(1, 1 + self.n_prev_motions + self.n_motions, self.feature_dim))
         else:
             self.PE = PositionalEncoding(self.feature_dim)
 
-        # Transformer decoder
+        # LSH Transformer decoder
         if self.architecture == 'decoder':
-            self.feature_proj = nn.Linear(self.motion_feat_dim + (1 if self.use_indicator else 0),
-                                          self.feature_dim)
-            # decoder_layer = nn.TransformerDecoderLayer(
-            #     d_model=self.feature_dim, nhead=self.n_heads, dim_feedforward=self.mlp_ratio * self.feature_dim,
-            #     activation='gelu', batch_first=True
-            # )
-            # self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=self.n_layers)
-
-            self.transformer = DeformableExpressionTransformer(
-                d_model=feature_dim,
-                n_heads=n_heads,
-                n_points=4,
-                n_layers=n_layers,
-                dim_feedforward=feature_dim * mlp_ratio,
-                dropout=0.1,
-                n_prev_motions=n_prev_motions,
-                n_motions=n_motions
-            )   
-
-
-
+            decoder_layer = LSHTransformerDecoderLayer(
+                d_model=self.feature_dim,
+                nhead=self.n_heads,
+                dim_feedforward=self.mlp_ratio * self.feature_dim
+            )
+            self.transformer = LSHTransformerDecoder(decoder_layer, num_layers=self.n_layers)
+            
             if self.align_mask_width > 0:
                 motion_len = self.n_prev_motions + self.n_motions
-                alignment_mask = enc_dec_mask(motion_len, motion_len, frame_width=1, expansion=self.align_mask_width - 1)
-                # print(f"alignment_mask: ", alignment_mask.shape)
-                # alignment_mask = F.pad(alignment_mask, (0, 0, 1, 0), value=False)
+                alignment_mask = enc_dec_mask(motion_len, motion_len, 
+                                           frame_width=1, 
+                                           expansion=self.align_mask_width - 1)
                 self.register_buffer('alignment_mask', alignment_mask)
-
-
-
-
             else:
                 self.alignment_mask = None
         else:
@@ -800,8 +687,6 @@ class DenoisingNetwork(nn.Module):
             nn.Linear(self.feature_dim, self.feature_dim // 2),
             nn.GELU(),
             nn.Linear(self.feature_dim // 2, self.motion_feat_dim),
-            # nn.Tanh() # 增加了一个tanh
-            # nn.Softmax()
         )
 
         self.to(device)
@@ -810,135 +695,37 @@ class DenoisingNetwork(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def format_shape_info(self, x):
-        """Helper to safely get shape info for different types."""
-        if torch.is_tensor(x):
-            return f"{x.shape} (tensor)"
-        elif isinstance(x, list):
-            return f"list of len {len(x)}"
-        elif isinstance(x, np.ndarray):
-            return f"{x.shape} (numpy)"
-        else:
-            return f"type: {type(x)}"
-
-
-    def display_mask_info(self, mask):
-        """Helper to format mask information."""
-        info = []
-        if torch.is_tensor(mask):
-            info.append(f"Shape: {mask.shape}")
-            info.append(f"Active positions: {mask.sum().item()}")
-            info.append(f"Sparsity: {(mask > 0).float().mean().item()*100:.1f}%")
-            first_block = mask[:5, :5].cpu().numpy()
-            info.append(f"First 5x5 block:\n{first_block}")
-        return "\n".join(info)
-
     def forward(self, motion_feat, audio_feat, prev_motion_feat, prev_audio_feat, step, indicator=None):
-        """
-        Forward pass with detailed debug logging.
-        """
-        logger.debug("\n=== DenoisingNetwork Forward Pass Start ===")
-        
-        # Log input shapes
-        for name, tensor in [
-            ('motion_feat', motion_feat),
-            ('audio_feat', audio_feat),
-            ('prev_motion_feat', prev_motion_feat),
-            ('prev_audio_feat', prev_audio_feat),
-            ('step', step)
-        ]:
-            logger.debug(f"  {name}: {self.format_shape_info(tensor)}")
-
-        # Convert step to tensor if needed
-        if isinstance(step, list):
-            logger.debug("Converting step from list to tensor")
-            step = torch.tensor(step, device=self.device)
-            logger.debug(f"  step tensor shape: {self.format_shape_info(step)}")
-
-        # Time step embedding
-        logger.debug("\n=== Time Step Embedding ===")
-        diff_step_embedding = self.diff_step_map(self.TE.pe[0, step]).unsqueeze(1)
-        logger.debug(f"Embedding: {self.format_shape_info(diff_step_embedding)}")
-        if torch.is_tensor(diff_step_embedding):
-            self.log_tensor_stats("Step embedding", diff_step_embedding)
-
-        # Process indicator
+        # Handle indicator if present
         if indicator is not None:
-            logger.debug("\n=== Processing Indicator ===")
-            logger.debug(f"Original: {self.format_shape_info(indicator)}")
-            padding = torch.zeros((indicator.shape[0], self.n_prev_motions), device=indicator.device)
-            indicator = torch.cat([padding, indicator], dim=1)
-            logger.debug(f"After padding: {self.format_shape_info(indicator)}")
-            if torch.is_tensor(indicator):
-                logger.debug(f"  Sum per batch: {indicator.sum(dim=1).tolist()}")
-            indicator = indicator.unsqueeze(-1)
-            logger.debug(f"Final: {self.format_shape_info(indicator)}")
+            indicator = torch.cat([
+                torch.zeros((indicator.shape[0], self.n_prev_motions), device=indicator.device),
+                indicator
+            ], dim=1).unsqueeze(-1)
 
-        # Feature processing
-        logger.debug("\n=== Feature Processing ===")
-        if self.architecture == 'decoder':
-            # Concatenate features
-            feats_in = torch.cat([prev_motion_feat, motion_feat], dim=1)
-            logger.debug(f"Combined features: {self.format_shape_info(feats_in)}")
-            
-            # Add indicator if needed
-            if self.use_indicator:
-                feats_in = torch.cat([feats_in, indicator], dim=-1)
-                logger.debug(f"With indicator: {self.format_shape_info(feats_in)}")
+        # Concat features
+        feats_in = torch.cat([prev_motion_feat, motion_feat], dim=1)
+        if self.use_indicator:
+            feats_in = torch.cat([feats_in, indicator], dim=-1)
 
-            # Project features
-            feats_in = self.feature_proj(feats_in)
-            logger.debug(f"Projected: {self.format_shape_info(feats_in)}")
-            if torch.is_tensor(feats_in):
-                self.log_tensor_stats("Projected features", feats_in)
+        # Project features
+        feats_in = self.feature_proj(feats_in)
 
-            # Position encoding
-            if self.use_learnable_pe:
-                logger.debug(f"Using learnable PE: {self.format_shape_info(self.PE)}")
-                feats_in = feats_in + self.PE + diff_step_embedding
-            else:
-                feats_in = self.PE(feats_in) + diff_step_embedding
-            logger.debug(f"After PE: {self.format_shape_info(feats_in)}")
-
-            # Audio features
-            audio_feat_in = torch.cat([prev_audio_feat, audio_feat], dim=1)
-            logger.debug(f"Audio features: {self.format_shape_info(audio_feat_in)}")
-
-            # Alignment mask
-            if self.alignment_mask is not None:
-                logger.debug("\nAlignment Mask Info:")
-                logger.debug(self.display_mask_info(self.alignment_mask))
-
-            # Transformer
-            logger.debug("\n=== Transformer ===")
-            feat_out = self.transformer(feats_in, audio_feat_in, memory_mask=self.alignment_mask)
-            logger.debug(f"Output: {self.format_shape_info(feat_out)}")
-            if torch.is_tensor(feat_out):
-                self.log_tensor_stats("Transformer output", feat_out)
-
-            # Motion decoding
-            logger.debug("\n=== Motion Decoder ===")
-            motion_feat_target = self.motion_dec(feat_out)
-            logger.debug(f"Final output: {self.format_shape_info(motion_feat_target)}")
-            if torch.is_tensor(motion_feat_target):
-                self.log_tensor_stats("Final output", motion_feat_target)
-                logger.debug(f"  Expected length: {self.n_prev_motions + self.n_motions}")
-                logger.debug(f"  Actual length: {motion_feat_target.shape[1]}")
-
+        # Add positional and temporal embeddings
+        diff_step_embedding = self.diff_step_map(self.TE.pe[0, step]).unsqueeze(1)
+        if self.use_learnable_pe:
+            feats_in = feats_in + self.PE + diff_step_embedding
         else:
-            raise ValueError(f'Unknown architecture: {self.architecture}')
+            feats_in = self.PE(feats_in) + diff_step_embedding
 
-        logger.debug("=== Forward Pass Complete ===\n")
+        # Transformer with LSH attention
+        audio_feat_in = torch.cat([prev_audio_feat, audio_feat], dim=1)
+        feat_out = self.transformer(feats_in, audio_feat_in, memory_mask=self.alignment_mask)
+
+        # Decode motion features
+        motion_feat_target = self.motion_dec(feat_out)
+
         return motion_feat_target
-
-    def log_tensor_stats(self, name, tensor):
-        """Helper to log tensor statistics."""
-        logger.debug(f"  {name} stats:")
-        logger.debug(f"    mean: {tensor.mean():.4f}")
-        logger.debug(f"    std: {tensor.std():.4f}")
-        logger.debug(f"    min: {tensor.min():.4f}")
-        logger.debug(f"    max: {tensor.max():.4f}")
-
 if __name__ == "__main__":
     device = "cuda"
     motion_feat_dim = 76
