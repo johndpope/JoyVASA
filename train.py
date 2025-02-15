@@ -17,7 +17,7 @@ from src.dataset.talkinghead_dataset_hungry import TalkingHeadDatasetHungry
 from src.modules.dit_talking_head import DitTalkingHead
 from logger import logger
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+import math
 import wandb
 import torch
 import matplotlib.pyplot as plt

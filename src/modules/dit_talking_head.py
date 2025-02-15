@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from logger import logger
 import traceback
 import numpy as np
-
+import math
 
 class FunctionalModule(nn.Module):
     """
@@ -229,113 +229,94 @@ class DitTalkingHead(nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
-
-
-
+    import math
+    
     def inner_loop_adaptation(self, f_denoise, motion_feat_noisy, audio_feat, 
                             prev_motion_feat, prev_audio_feat, time_step, indicator,
-                            motion_feat, num_inner_steps=3):
-        """Optimized inner-loop adaptation with better parameter tracking"""
+                            motion_feat, num_inner_steps=10):  # Increased from 3 to 10
+        """Optimized inner-loop adaptation with more steps and adaptive stopping"""
         
         torch.autograd.set_detect_anomaly(True)
         
-        def debug_tensor(x, name):
-            if torch.is_tensor(x):
-                logger.debug(f"{name}:")
-                logger.debug(f"  shape: {x.shape}")
-                logger.debug(f"  requires_grad: {x.requires_grad}")
-                logger.debug(f"  grad_fn: {x.grad_fn}")
-                logger.debug(f"  is_leaf: {x.is_leaf}")
-        
         # Set up input tensors
-        logger.debug("Setting up input tensors...")
         motion_feat_noisy = motion_feat_noisy.detach().requires_grad_(True)
         audio_feat = audio_feat.detach().requires_grad_(True)
         prev_motion_feat = prev_motion_feat.detach().requires_grad_(True)
         prev_audio_feat = prev_audio_feat.detach().requires_grad_(True)
         motion_feat = motion_feat.detach().requires_grad_(True)
         
-        debug_tensor(motion_feat_noisy, "motion_feat_noisy")
-        debug_tensor(audio_feat, "audio_feat")
-        debug_tensor(prev_motion_feat, "prev_motion_feat")
-        debug_tensor(prev_audio_feat, "prev_audio_feat")
-        debug_tensor(motion_feat, "motion_feat")
-        
-        # Initialize optimizer parameters
-        initial_lr = 1e-2
-        warmup_steps = 1
-        decay_rate = 0.9
+        # Initialize optimizer parameters with cosine learning rate schedule
+        initial_lr = 2e-2  # Slightly increased initial learning rate
+        min_lr = 1e-3
         momentum_factor = 0.9
+        patience = 3  # Number of steps to wait before early stopping
+        min_improvement = 1e-4  # Minimum improvement threshold
         
         loss_history = []
+        best_loss = float('inf')
+        patience_counter = 0
         
         # Create parameter copies with gradient tracking
-        logger.debug("Creating parameter copies...")
         param_dict = {}
         momentum_dict = {}
+        best_params = {}
+        
         for name, param in f_denoise.named_parameters():
             if param.requires_grad:
-                # Create new parameter with gradient tracking
                 param_dict[name] = param.detach().clone().requires_grad_(True)
                 momentum_dict[name] = torch.zeros_like(param.data)
-                debug_tensor(param_dict[name], f"param_dict[{name}]")
-        
-        # Assign initial parameter values
-        with torch.no_grad():
-            for name, param in f_denoise.named_parameters():
-                if param.requires_grad:
-                    param.data.copy_(param_dict[name].data)
+                best_params[name] = param_dict[name].clone()
         
         for step in range(num_inner_steps):
-            logger.debug(f"\nStarting inner loop step {step}")
             try:
-                # Enable gradient tracking for forward pass
+                # Calculate cosine learning rate
+                progress = step / num_inner_steps
+                current_lr = min_lr + 0.5 * (initial_lr - min_lr) * (1 + math.cos(progress * math.pi))
+                
+                # Forward pass with gradient tracking
                 with torch.enable_grad():
-                    # Forward pass
                     pred = f_denoise(motion_feat_noisy, audio_feat, 
                                 prev_motion_feat, prev_audio_feat, 
                                 time_step, indicator)
                     
-                    debug_tensor(pred, "pred")
-                    
-                    # Extract current predictions
                     pred_current = pred[:, -self.n_motions:, :]
                     
-                    debug_tensor(pred_current, "pred_current")
+                    # Compute loss with L1 regularization
+                    mse_loss = F.mse_loss(pred_current, motion_feat)
+                    l1_reg = 1e-5 * sum(p.abs().sum() for name, p in param_dict.items())
+                    smoothness = 1e-4 * torch.mean(torch.abs(pred_current[:, 1:] - pred_current[:, :-1]))
                     
-                    # Compute loss
-                    loss_inner = F.mse_loss(pred_current, motion_feat)
+                    loss_inner = mse_loss + l1_reg + smoothness
                     
-                    # Add L2 regularization
-                    l2_reg = sum(p.pow(2).sum() for name, p in param_dict.items())
-                    loss_inner = loss_inner + 1e-5 * l2_reg
-                    
-                    debug_tensor(loss_inner, "loss_inner")
+                    current_loss = loss_inner.item()
+                    loss_history.append(current_loss)
                     
                     logger.debug(f"Step {step}:")
-                    logger.debug(f"  Loss value: {loss_inner.item():.6f}")
+                    logger.debug(f"  Loss: {current_loss:.6f}")
+                    logger.debug(f"  Learning rate: {current_lr:.6f}")
                     
-                    # Store loss history
-                    loss_history.append(loss_inner.item())
+                    # Check for improvement
+                    if current_loss < best_loss - min_improvement:
+                        best_loss = current_loss
+                        patience_counter = 0
+                        # Save best parameters
+                        for name, param in param_dict.items():
+                            best_params[name] = param.clone()
+                    else:
+                        patience_counter += 1
                     
-                    # Calculate learning rate
-                    current_lr = initial_lr
-                    if step >= warmup_steps and len(loss_history) >= 2:
-                        loss_improvement = (loss_history[-2] - loss_history[-1]) / (loss_history[-2] + 1e-8)
-                        if loss_improvement < 0.01:
-                            current_lr *= decay_rate
+                    # Early stopping check
+                    if patience_counter >= patience:
+                        logger.debug(f"Early stopping at step {step}")
+                        break
                     
-                    logger.debug("Computing gradients...")
-                    # Get parameters that require gradients
+                    # Compute and apply gradients
                     trainable_params = []
                     param_names = []
-                    for name, param in f_denoise.named_parameters():
-                        if param.requires_grad:
-                            trainable_params.append(param_dict[name])
-                            param_names.append(name)
-                            debug_tensor(param_dict[name], f"trainable_param[{name}]")
+                    for name, param in param_dict.items():
+                        trainable_params.append(param)
+                        param_names.append(name)
                     
-                    # Compute gradients
                     grads = torch.autograd.grad(
                         loss_inner,
                         trainable_params,
@@ -344,40 +325,189 @@ class DitTalkingHead(nn.Module):
                         allow_unused=True
                     )
                     
-                    logger.debug("Updating parameters...")
                     # Update parameters
                     with torch.no_grad():
                         for name, param, grad in zip(param_names, trainable_params, grads):
                             if grad is not None:
-                                # Update momentum
+                                # Momentum update
                                 new_momentum = momentum_factor * momentum_dict[name] + (1 - momentum_factor) * grad
                                 momentum_dict[name] = new_momentum
                                 
-                                # Update parameter
+                                # Parameter update
                                 new_param = param - current_lr * new_momentum
                                 param_dict[name] = new_param.clone().requires_grad_(True)
                                 
-                                # Update original parameter
+                                # Update model parameter
                                 orig_param = dict(f_denoise.named_parameters())[name]
                                 orig_param.data.copy_(new_param.data)
-                                
-                                debug_tensor(param_dict[name], f"updated_param[{name}]")
             
             except Exception as e:
                 logger.error(f"Error during step {step}: {str(e)}")
                 logger.error(f"Traceback: {traceback.format_exc()}")
                 raise
         
-        logger.debug("Computing final output...")
+        # Restore best parameters
+        with torch.no_grad():
+            for name, param in f_denoise.named_parameters():
+                if name in best_params:
+                    param.data.copy_(best_params[name].data)
+        
         # Final forward pass
         with torch.enable_grad():
             motion_feat_target = f_denoise(motion_feat_noisy, audio_feat,
                                         prev_motion_feat, prev_audio_feat,
                                         time_step, indicator)
-            debug_tensor(motion_feat_target, "motion_feat_target")
         
         torch.autograd.set_detect_anomaly(False)
         return motion_feat_target
+
+
+    # def inner_loop_adaptation(self, f_denoise, motion_feat_noisy, audio_feat, 
+    #                         prev_motion_feat, prev_audio_feat, time_step, indicator,
+    #                         motion_feat, num_inner_steps=3):
+    #     """Optimized inner-loop adaptation with better parameter tracking"""
+        
+    #     torch.autograd.set_detect_anomaly(True)
+        
+    #     def debug_tensor(x, name):
+    #         if torch.is_tensor(x):
+    #             logger.debug(f"{name}:")
+    #             logger.debug(f"  shape: {x.shape}")
+    #             logger.debug(f"  requires_grad: {x.requires_grad}")
+    #             logger.debug(f"  grad_fn: {x.grad_fn}")
+    #             logger.debug(f"  is_leaf: {x.is_leaf}")
+        
+    #     # Set up input tensors
+    #     logger.debug("Setting up input tensors...")
+    #     motion_feat_noisy = motion_feat_noisy.detach().requires_grad_(True)
+    #     audio_feat = audio_feat.detach().requires_grad_(True)
+    #     prev_motion_feat = prev_motion_feat.detach().requires_grad_(True)
+    #     prev_audio_feat = prev_audio_feat.detach().requires_grad_(True)
+    #     motion_feat = motion_feat.detach().requires_grad_(True)
+        
+    #     debug_tensor(motion_feat_noisy, "motion_feat_noisy")
+    #     debug_tensor(audio_feat, "audio_feat")
+    #     debug_tensor(prev_motion_feat, "prev_motion_feat")
+    #     debug_tensor(prev_audio_feat, "prev_audio_feat")
+    #     debug_tensor(motion_feat, "motion_feat")
+        
+    #     # Initialize optimizer parameters
+    #     initial_lr = 1e-2
+    #     warmup_steps = 1
+    #     decay_rate = 0.9
+    #     momentum_factor = 0.9
+        
+    #     loss_history = []
+        
+    #     # Create parameter copies with gradient tracking
+    #     logger.debug("Creating parameter copies...")
+    #     param_dict = {}
+    #     momentum_dict = {}
+    #     for name, param in f_denoise.named_parameters():
+    #         if param.requires_grad:
+    #             # Create new parameter with gradient tracking
+    #             param_dict[name] = param.detach().clone().requires_grad_(True)
+    #             momentum_dict[name] = torch.zeros_like(param.data)
+    #             debug_tensor(param_dict[name], f"param_dict[{name}]")
+        
+    #     # Assign initial parameter values
+    #     with torch.no_grad():
+    #         for name, param in f_denoise.named_parameters():
+    #             if param.requires_grad:
+    #                 param.data.copy_(param_dict[name].data)
+        
+    #     for step in range(num_inner_steps):
+    #         logger.debug(f"\nStarting inner loop step {step}")
+    #         try:
+    #             # Enable gradient tracking for forward pass
+    #             with torch.enable_grad():
+    #                 # Forward pass
+    #                 pred = f_denoise(motion_feat_noisy, audio_feat, 
+    #                             prev_motion_feat, prev_audio_feat, 
+    #                             time_step, indicator)
+                    
+    #                 debug_tensor(pred, "pred")
+                    
+    #                 # Extract current predictions
+    #                 pred_current = pred[:, -self.n_motions:, :]
+                    
+    #                 debug_tensor(pred_current, "pred_current")
+                    
+    #                 # Compute loss
+    #                 loss_inner = F.mse_loss(pred_current, motion_feat)
+                    
+    #                 # Add L2 regularization
+    #                 l2_reg = sum(p.pow(2).sum() for name, p in param_dict.items())
+    #                 loss_inner = loss_inner + 1e-5 * l2_reg
+                    
+    #                 debug_tensor(loss_inner, "loss_inner")
+                    
+    #                 logger.debug(f"Step {step}:")
+    #                 logger.debug(f"  Loss value: {loss_inner.item():.6f}")
+                    
+    #                 # Store loss history
+    #                 loss_history.append(loss_inner.item())
+                    
+    #                 # Calculate learning rate
+    #                 current_lr = initial_lr
+    #                 if step >= warmup_steps and len(loss_history) >= 2:
+    #                     loss_improvement = (loss_history[-2] - loss_history[-1]) / (loss_history[-2] + 1e-8)
+    #                     if loss_improvement < 0.01:
+    #                         current_lr *= decay_rate
+                    
+    #                 logger.debug("Computing gradients...")
+    #                 # Get parameters that require gradients
+    #                 trainable_params = []
+    #                 param_names = []
+    #                 for name, param in f_denoise.named_parameters():
+    #                     if param.requires_grad:
+    #                         trainable_params.append(param_dict[name])
+    #                         param_names.append(name)
+    #                         debug_tensor(param_dict[name], f"trainable_param[{name}]")
+                    
+    #                 # Compute gradients
+    #                 grads = torch.autograd.grad(
+    #                     loss_inner,
+    #                     trainable_params,
+    #                     create_graph=True,
+    #                     retain_graph=True,
+    #                     allow_unused=True
+    #                 )
+                    
+    #                 logger.debug("Updating parameters...")
+    #                 # Update parameters
+    #                 with torch.no_grad():
+    #                     for name, param, grad in zip(param_names, trainable_params, grads):
+    #                         if grad is not None:
+    #                             # Update momentum
+    #                             new_momentum = momentum_factor * momentum_dict[name] + (1 - momentum_factor) * grad
+    #                             momentum_dict[name] = new_momentum
+                                
+    #                             # Update parameter
+    #                             new_param = param - current_lr * new_momentum
+    #                             param_dict[name] = new_param.clone().requires_grad_(True)
+                                
+    #                             # Update original parameter
+    #                             orig_param = dict(f_denoise.named_parameters())[name]
+    #                             orig_param.data.copy_(new_param.data)
+                                
+    #                             debug_tensor(param_dict[name], f"updated_param[{name}]")
+            
+    #         except Exception as e:
+    #             logger.error(f"Error during step {step}: {str(e)}")
+    #             logger.error(f"Traceback: {traceback.format_exc()}")
+    #             raise
+        
+    #     logger.debug("Computing final output...")
+    #     # Final forward pass
+    #     with torch.enable_grad():
+    #         motion_feat_target = f_denoise(motion_feat_noisy, audio_feat,
+    #                                     prev_motion_feat, prev_audio_feat,
+    #                                     time_step, indicator)
+    #         debug_tensor(motion_feat_target, "motion_feat_target")
+        
+    #     torch.autograd.set_detect_anomaly(False)
+    #     return motion_feat_target
 
     def forward(self, motion_feat, audio_or_feat, prev_motion_feat=None, prev_audio_feat=None, time_step=None, indicator=None):
         """
