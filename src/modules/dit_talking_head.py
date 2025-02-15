@@ -5,10 +5,95 @@ import platform
 
 from .common import PositionalEncoding, enc_dec_mask, pad_audio
 from ..config.base_config import make_abs_path
-import math
+from contextlib import contextmanager
 from logger import logger
+import traceback
+import numpy as np
 
 
+class FunctionalModule(nn.Module):
+    """
+    Enhanced FunctionalModule that properly handles nested parameters and ensures gradient flow.
+    """
+    def __init__(self, module: nn.Module):
+        super().__init__()
+        self.module = module
+        self.fast_params = {}
+        self._create_fast_params(module)
+    
+    def _create_fast_params(self, module, prefix=''):
+        """Recursively create fast parameters for all nested modules."""
+        for name, param in module.named_parameters(recurse=False):
+            param_name = f"{prefix}.{name}" if prefix else name
+            self.fast_params[param_name] = param.clone().detach().requires_grad_(True)
+            
+        for child_name, child in module.named_children():
+            child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+            self._create_fast_params(child, prefix=child_prefix)
+    
+    def _update_module_params(self, module, prefix=''):
+        """Recursively update module parameters with fast parameters."""
+        for name, param in module.named_parameters(recurse=False):
+            param_name = f"{prefix}.{name}" if prefix else name
+            if param_name in self.fast_params:
+                param.data = self.fast_params[param_name].data
+                
+        for child_name, child in module.named_children():
+            child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+            self._update_module_params(child, prefix=child_prefix)
+    
+    def forward(self, *args, params=None, **kwargs):
+        if params is not None:
+            self.fast_params = params
+        
+        # Temporarily update module parameters with fast parameters
+        original_params = {}
+        for name, param in self.module.named_parameters():
+            original_params[name] = param.data.clone()
+            if name in self.fast_params:
+                param.data = self.fast_params[name].data
+        
+        try:
+            output = self.module(*args, **kwargs)
+        finally:
+            # Restore original parameters
+            for name, param in self.module.named_parameters():
+                if name in original_params:
+                    param.data = original_params[name]
+        
+        return output
+    
+    def parameters(self):
+        """Return fast parameters in the same order as module.parameters()."""
+        for name, _ in self.module.named_parameters():
+            if name in self.fast_params:
+                yield self.fast_params[name]
+
+def update_fast_params(fmodule: FunctionalModule, grads, lr):
+    """
+    Update the fast parameters using SGD, ensuring proper gradient application.
+    """
+    updated = {}
+    for (name, param), grad in zip(fmodule.fast_params.items(), grads):
+        if grad is not None:
+            updated[name] = param - lr * grad
+        else:
+            updated[name] = param.clone()
+    fmodule.fast_params = updated
+
+@contextmanager
+def functional_context(module: nn.Module):
+    """
+    Enhanced context manager that ensures proper cleanup of functional module.
+    """
+    fmodule = FunctionalModule(module)
+    try:
+        yield fmodule
+    finally:
+        # Clean up by explicitly deleting the functional module
+        del fmodule.fast_params
+        del fmodule.module
+    
 class DiffusionSchedule(nn.Module):
     def __init__(self, num_steps, mode='linear', beta_1=1e-4, beta_T=0.02, s=0.008):
         super().__init__()
@@ -59,287 +144,26 @@ class DiffusionSchedule(nn.Module):
         return sigmas
 
 
-class LSHTransformerDecoder(nn.Module):
-    def __init__(self, decoder_layer, num_layers):
-        super().__init__()
-        self.layers = nn.ModuleList([decoder_layer for _ in range(num_layers)])
-        self.norm = nn.LayerNorm(decoder_layer.linear1.in_features)
-        self.num_layers = num_layers
+class InnerLoopOptimizer:
+    def __init__(self, initial_lr=1e-2, warmup_steps=1, decay_rate=0.9):
+        self.initial_lr = initial_lr
+        self.warmup_steps = warmup_steps
+        self.decay_rate = decay_rate
         
-        logger.debug(f"Initializing LSH Transformer Decoder with {num_layers} layers")
-        logger.debug(f"Layer normalization dimension: {decoder_layer.linear1.in_features}")
-    
-    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None):
-        """
-        Args:
-            tgt: Target sequence (N, L, d_model)
-            memory: Memory from encoder (N, S, d_model)
-            tgt_mask: Target sequence mask (optional)
-            memory_mask: Memory mask (optional)
-        """
-        output = tgt
+    def get_lr(self, step, loss_history):
+        # Implement warmup
+        if step < self.warmup_steps:
+            return self.initial_lr * ((step + 1) / self.warmup_steps)
+            
+        # Implement decay based on loss improvement
+        if len(loss_history) >= 2:
+            loss_improvement = (loss_history[-2] - loss_history[-1]) / loss_history[-2]
+            if loss_improvement < 0.01:  # If improvement is small
+                return self.initial_lr * (self.decay_rate ** (step - self.warmup_steps))
         
-        logger.debug(f"\nLSH Transformer Decoder Forward Pass")
-        logger.debug(f"Input shapes - tgt: {tgt.shape}, memory: {memory.shape}")
-        if tgt_mask is not None:
-            logger.debug(f"Target mask shape: {tgt_mask.shape}")
-        if memory_mask is not None:
-            logger.debug(f"Memory mask shape: {memory_mask.shape}")
-
-        # Debug tensor statistics
-        with torch.no_grad():
-            logger.debug(f"Input statistics:")
-            logger.debug(f"  tgt - mean: {tgt.mean():.4f}, std: {tgt.std():.4f}")
-            logger.debug(f"  memory - mean: {memory.mean():.4f}, std: {memory.std():.4f}")
-            
-        # Process through decoder layers
-        for idx, layer in enumerate(self.layers):
-            logger.debug(f"\nProcessing decoder layer {idx + 1}/{self.num_layers}")
-            
-            # Record statistics before layer
-            with torch.no_grad():
-                pre_mean = output.mean().item()
-                pre_std = output.std().item()
-            
-            # Forward pass through layer
-            output = layer(output, memory, tgt_mask, memory_mask)
-            
-            # Record statistics after layer
-            with torch.no_grad():
-                post_mean = output.mean().item()
-                post_std = output.std().item()
-                logger.debug(f"Layer {idx + 1} statistics:")
-                logger.debug(f"  Pre  - mean: {pre_mean:.4f}, std: {pre_std:.4f}")
-                logger.debug(f"  Post - mean: {post_mean:.4f}, std: {post_std:.4f}")
-            
-            # Check for NaN/Inf values
-            if torch.isnan(output).any():
-                logger.error(f"NaN detected in output of layer {idx + 1}")
-            if torch.isinf(output).any():
-                logger.error(f"Inf detected in output of layer {idx + 1}")
-
-        # Final normalization
-        output = self.norm(output)
-        
-        # Final output statistics
-        with torch.no_grad():
-            logger.debug(f"\nFinal output statistics:")
-            logger.debug(f"  Shape: {output.shape}")
-            logger.debug(f"  Mean: {output.mean():.4f}")
-            logger.debug(f"  Std: {output.std():.4f}")
-            logger.debug(f"  Min: {output.min():.4f}")
-            logger.debug(f"  Max: {output.max():.4f}")
-            
-        return output
-        
-    def debug_attention_patterns(self, attn_weights):
-        """Debug helper to analyze attention patterns"""
-        with torch.no_grad():
-            # Average attention weights across heads
-            avg_attn = attn_weights.mean(dim=1)  # Average across heads
-            
-            logger.debug(f"\nAttention Pattern Analysis:")
-            logger.debug(f"  Shape: {attn_weights.shape}")
-            logger.debug(f"  Mean attention weight: {avg_attn.mean():.4f}")
-            logger.debug(f"  Max attention weight: {avg_attn.max():.4f}")
-            
-            # Check for attention concentration
-            top_k = 5
-            values, _ = torch.topk(avg_attn.flatten(), top_k)
-            logger.debug(f"  Top {top_k} attention weights: {values.tolist()}")
-            
-            # Check for uniform attention
-            uniformity = -(avg_attn * torch.log(avg_attn + 1e-9)).sum(dim=-1).mean()
-            logger.debug(f"  Attention uniformity (entropy): {uniformity:.4f}")
+        return self.initial_lr
 
 
-import math
-
-class LSHAttention(nn.Module):
-    def __init__(self, feature_dim, n_heads=8, n_hashes=4, bucket_size=64):
-        super().__init__()
-        self.feature_dim = feature_dim
-        self.n_heads = n_heads
-        self.n_hashes = n_hashes
-        self.bucket_size = bucket_size
-        self.head_dim = feature_dim // n_heads
-        
-        logger.debug(f"Initializing LSH Attention with dims: feature={feature_dim}, heads={n_heads}, head_dim={self.head_dim}")
-        
-        self.qk_proj = nn.Linear(feature_dim, feature_dim * 2)
-        self.v_proj = nn.Linear(feature_dim, feature_dim)
-        self.out_proj = nn.Linear(feature_dim, feature_dim)
-        
-        # Random rotation matrix for LSH
-        self.register_buffer('random_rotations', 
-            torch.randn(n_heads, n_hashes, self.head_dim, device='cuda') * 0.02)
-
-    def hash_vectors(self, vectors):
-        """Hash vectors to buckets using random rotations"""
-        # vectors: [batch, seq_len, n_heads, head_dim]
-        logger.debug(f"Hashing vectors shape: {vectors.shape}")
-        logger.debug(f"Random rotations shape: {self.random_rotations.shape}")
-        
-        # Reshape for batch and heads
-        B, L, H, D = vectors.shape
-        vectors = vectors.permute(0, 2, 1, 3)  # [B, H, L, D]
-        
-        # Multiply by random rotations
-        rotated = torch.einsum('bhld,hrd->bhlr', vectors, self.random_rotations)
-        logger.debug(f"Rotated vectors shape: {rotated.shape}")
-        
-        # Convert to buckets
-        buckets = torch.argmax(torch.cat([rotated, -rotated], dim=-1), dim=-1)  # [B, H, L]
-        logger.debug(f"Buckets shape: {buckets.shape}")
-        
-        return buckets
-
-    def sort_by_buckets(self, buckets, *tensors):
-        """Sort tensors according to bucket assignments"""
-        B, H, L = buckets.shape  # [batch_size, n_heads, seq_len]
-        logger.debug(f"Sort by buckets - buckets shape: {buckets.shape}")
-        
-        for i, tensor in enumerate(tensors):
-            logger.debug(f"Sort by buckets - tensor {i} shape: {tensor.shape}")
-        
-        # Get indices for sorting
-        indices = buckets.argsort(dim=-1)  # [B, H, L]
-        logger.debug(f"Sorted indices shape: {indices.shape}")
-        
-        # Sort all tensors according to bucket ordering
-        sorted_tensors = []
-        for tensor in tensors:
-            # tensor shape: [batch, seq_len, n_heads, head_dim]
-            # Reshape to [batch, n_heads, seq_len, head_dim]
-            tensor = tensor.permute(0, 2, 1, 3)
-            
-            # Gather elements using sorted indices
-            gather_index = indices.unsqueeze(-1).expand(-1, -1, -1, tensor.size(-1))
-            sorted_tensor = torch.gather(tensor, dim=2, index=gather_index)
-            
-            # Reshape back to [batch, seq_len, n_heads, head_dim]
-            sorted_tensor = sorted_tensor.permute(0, 2, 1, 3)
-            logger.debug(f"Sorted tensor shape: {sorted_tensor.shape}")
-            
-            sorted_tensors.append(sorted_tensor)
-            
-        return tuple(sorted_tensors) + (indices,)
-
-    def forward(self, x, mask=None):
-        batch_size, seq_len, _ = x.shape
-        logger.debug(f"\nLSH Attention Forward - Input shape: {x.shape}")
-        if mask is not None:
-            logger.debug(f"Input mask shape: {mask.shape}")
-        
-        # Project queries, keys and values
-        qk = self.qk_proj(x)
-        q, k = qk.chunk(2, dim=-1)
-        v = self.v_proj(x)
-        
-        # Split heads
-        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
-        k = k.view(batch_size, seq_len, self.n_heads, self.head_dim)
-        v = v.view(batch_size, seq_len, self.n_heads, self.head_dim)
-        
-        logger.debug(f"After head split - Q shape: {q.shape}")
-        
-        # Compute LSH buckets
-        buckets = self.hash_vectors(q)
-        logger.debug(f"Computed buckets shape: {buckets.shape}")
-        
-        # Sort according to buckets
-        sorted_q, sorted_k, sorted_v, indices = self.sort_by_buckets(buckets, q, k, v)
-        logger.debug(f"After sorting - Q shape: {sorted_q.shape}")
-        
-        # Compute attention scores
-        sorted_q = sorted_q.permute(0, 2, 1, 3)  # [B, H, L, D]
-        sorted_k = sorted_k.permute(0, 2, 1, 3)  # [B, H, L, D]
-        sorted_v = sorted_v.permute(0, 2, 1, 3)  # [B, H, L, D]
-        
-        dots = torch.matmul(sorted_q, sorted_k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        logger.debug(f"Attention scores shape: {dots.shape}")
-        
-        # Handle masking
-        if mask is not None:
-            # Create proper mask for bucketed attention
-            if mask.dim() == 2:
-                # Expand mask to match batch size and heads
-                mask = mask.unsqueeze(0).expand(batch_size, -1, -1)  # [B, L, L]
-                logger.debug(f"Expanded 2D mask shape: {mask.shape}")
-            mask = mask.unsqueeze(1).expand(-1, self.n_heads, -1, -1)  # [B, H, L, L]
-            logger.debug(f"Final mask shape before sorting: {mask.shape}")
-            
-            # Sort mask according to indices
-            indices_expanded_q = indices.unsqueeze(-1).expand(-1, -1, -1, seq_len)
-            indices_expanded_k = indices.unsqueeze(-2).expand(-1, -1, seq_len, -1)
-            
-            # Apply the same sorting to mask rows and columns
-            mask_sorted = mask.gather(2, indices_expanded_q)
-            mask_sorted = mask_sorted.gather(3, indices_expanded_k)
-            logger.debug(f"Sorted mask shape: {mask_sorted.shape}")
-            
-            dots = dots.masked_fill(~mask_sorted, float('-inf'))
-        
-        # Apply softmax
-        attn = F.softmax(dots, dim=-1)
-        logger.debug(f"Attention weights shape: {attn.shape}")
-        
-        # Apply attention to values
-        out = torch.matmul(attn, sorted_v)  # [B, H, L, D]
-        logger.debug(f"After attention shape: {out.shape}")
-        
-        # Restore original ordering
-        restore_indices = indices.argsort(dim=-1)
-        restore_indices = restore_indices.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-        out = torch.gather(out, dim=2, index=restore_indices)
-        
-        # Reshape to [B, L, H, D]
-        out = out.permute(0, 2, 1, 3)
-        logger.debug(f"After restoring order shape: {out.shape}")
-        
-        # Combine heads
-        out = out.reshape(batch_size, seq_len, self.feature_dim)
-        logger.debug(f"Final output shape: {out.shape}")
-        
-        return self.out_proj(out)
-
-    
-class LSHTransformerDecoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward=2048):
-        super().__init__()
-        self.self_attn = LSHAttention(d_model, nhead)
-        self.cross_attn = LSHAttention(d_model, nhead)
-        
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        
-        self.dropout = nn.Dropout(0.1)
-        self.activation = F.gelu
-
-    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None):
-        logger.debug(f"\nLSH Transformer Decoder Layer - Input shapes: tgt={tgt.shape}, memory={memory.shape}")
-        
-        # Self attention
-        tgt2 = self.self_attn(self.norm1(tgt), mask=tgt_mask)
-        tgt = tgt + self.dropout(tgt2)
-        logger.debug(f"After self attention shape: {tgt.shape}")
-        
-        # Cross attention
-        tgt2 = self.cross_attn(self.norm2(tgt), mask=memory_mask)
-        tgt = tgt + self.dropout(tgt2)
-        logger.debug(f"After cross attention shape: {tgt.shape}")
-        
-        # Feedforward
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(self.norm3(tgt)))))
-        tgt = tgt + self.dropout(tgt2)
-        logger.debug(f"After feedforward shape: {tgt.shape}")
-        
-        return tgt
-      
 class DitTalkingHead(nn.Module):
     def __init__(self, device='cuda', target="sample", architecture="decoder",
                  motion_feat_dim=76, fps=25, n_motions=100, n_prev_motions=10, 
@@ -405,6 +229,155 @@ class DitTalkingHead(nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
+
+
+
+    def inner_loop_adaptation(self, f_denoise, motion_feat_noisy, audio_feat, 
+                            prev_motion_feat, prev_audio_feat, time_step, indicator,
+                            motion_feat, num_inner_steps=3):
+        """Optimized inner-loop adaptation with better parameter tracking"""
+        
+        torch.autograd.set_detect_anomaly(True)
+        
+        def debug_tensor(x, name):
+            if torch.is_tensor(x):
+                logger.debug(f"{name}:")
+                logger.debug(f"  shape: {x.shape}")
+                logger.debug(f"  requires_grad: {x.requires_grad}")
+                logger.debug(f"  grad_fn: {x.grad_fn}")
+                logger.debug(f"  is_leaf: {x.is_leaf}")
+        
+        # Set up input tensors
+        logger.debug("Setting up input tensors...")
+        motion_feat_noisy = motion_feat_noisy.detach().requires_grad_(True)
+        audio_feat = audio_feat.detach().requires_grad_(True)
+        prev_motion_feat = prev_motion_feat.detach().requires_grad_(True)
+        prev_audio_feat = prev_audio_feat.detach().requires_grad_(True)
+        motion_feat = motion_feat.detach().requires_grad_(True)
+        
+        debug_tensor(motion_feat_noisy, "motion_feat_noisy")
+        debug_tensor(audio_feat, "audio_feat")
+        debug_tensor(prev_motion_feat, "prev_motion_feat")
+        debug_tensor(prev_audio_feat, "prev_audio_feat")
+        debug_tensor(motion_feat, "motion_feat")
+        
+        # Initialize optimizer parameters
+        initial_lr = 1e-2
+        warmup_steps = 1
+        decay_rate = 0.9
+        momentum_factor = 0.9
+        
+        loss_history = []
+        
+        # Create parameter copies with gradient tracking
+        logger.debug("Creating parameter copies...")
+        param_dict = {}
+        momentum_dict = {}
+        for name, param in f_denoise.named_parameters():
+            if param.requires_grad:
+                # Create new parameter with gradient tracking
+                param_dict[name] = param.detach().clone().requires_grad_(True)
+                momentum_dict[name] = torch.zeros_like(param.data)
+                debug_tensor(param_dict[name], f"param_dict[{name}]")
+        
+        # Assign initial parameter values
+        with torch.no_grad():
+            for name, param in f_denoise.named_parameters():
+                if param.requires_grad:
+                    param.data.copy_(param_dict[name].data)
+        
+        for step in range(num_inner_steps):
+            logger.debug(f"\nStarting inner loop step {step}")
+            try:
+                # Enable gradient tracking for forward pass
+                with torch.enable_grad():
+                    # Forward pass
+                    pred = f_denoise(motion_feat_noisy, audio_feat, 
+                                prev_motion_feat, prev_audio_feat, 
+                                time_step, indicator)
+                    
+                    debug_tensor(pred, "pred")
+                    
+                    # Extract current predictions
+                    pred_current = pred[:, -self.n_motions:, :]
+                    
+                    debug_tensor(pred_current, "pred_current")
+                    
+                    # Compute loss
+                    loss_inner = F.mse_loss(pred_current, motion_feat)
+                    
+                    # Add L2 regularization
+                    l2_reg = sum(p.pow(2).sum() for name, p in param_dict.items())
+                    loss_inner = loss_inner + 1e-5 * l2_reg
+                    
+                    debug_tensor(loss_inner, "loss_inner")
+                    
+                    logger.debug(f"Step {step}:")
+                    logger.debug(f"  Loss value: {loss_inner.item():.6f}")
+                    
+                    # Store loss history
+                    loss_history.append(loss_inner.item())
+                    
+                    # Calculate learning rate
+                    current_lr = initial_lr
+                    if step >= warmup_steps and len(loss_history) >= 2:
+                        loss_improvement = (loss_history[-2] - loss_history[-1]) / (loss_history[-2] + 1e-8)
+                        if loss_improvement < 0.01:
+                            current_lr *= decay_rate
+                    
+                    logger.debug("Computing gradients...")
+                    # Get parameters that require gradients
+                    trainable_params = []
+                    param_names = []
+                    for name, param in f_denoise.named_parameters():
+                        if param.requires_grad:
+                            trainable_params.append(param_dict[name])
+                            param_names.append(name)
+                            debug_tensor(param_dict[name], f"trainable_param[{name}]")
+                    
+                    # Compute gradients
+                    grads = torch.autograd.grad(
+                        loss_inner,
+                        trainable_params,
+                        create_graph=True,
+                        retain_graph=True,
+                        allow_unused=True
+                    )
+                    
+                    logger.debug("Updating parameters...")
+                    # Update parameters
+                    with torch.no_grad():
+                        for name, param, grad in zip(param_names, trainable_params, grads):
+                            if grad is not None:
+                                # Update momentum
+                                new_momentum = momentum_factor * momentum_dict[name] + (1 - momentum_factor) * grad
+                                momentum_dict[name] = new_momentum
+                                
+                                # Update parameter
+                                new_param = param - current_lr * new_momentum
+                                param_dict[name] = new_param.clone().requires_grad_(True)
+                                
+                                # Update original parameter
+                                orig_param = dict(f_denoise.named_parameters())[name]
+                                orig_param.data.copy_(new_param.data)
+                                
+                                debug_tensor(param_dict[name], f"updated_param[{name}]")
+            
+            except Exception as e:
+                logger.error(f"Error during step {step}: {str(e)}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                raise
+        
+        logger.debug("Computing final output...")
+        # Final forward pass
+        with torch.enable_grad():
+            motion_feat_target = f_denoise(motion_feat_noisy, audio_feat,
+                                        prev_motion_feat, prev_audio_feat,
+                                        time_step, indicator)
+            debug_tensor(motion_feat_target, "motion_feat_target")
+        
+        torch.autograd.set_detect_anomaly(False)
+        return motion_feat_target
 
     def forward(self, motion_feat, audio_or_feat, prev_motion_feat=None, prev_audio_feat=None, time_step=None, indicator=None):
         """
@@ -476,11 +449,110 @@ class DitTalkingHead(nn.Module):
         motion_feat_noisy = c0 * motion_feat + c1 * eps
 
         # The reverse diffusion process
-        motion_feat_target = self.denoising_net(motion_feat_noisy, audio_feat, 
-                                                prev_motion_feat, prev_audio_feat, time_step, indicator)
+        # motion_feat_target = self.denoising_net(motion_feat_noisy, audio_feat, 
+        #                                         prev_motion_feat, prev_audio_feat, time_step, indicator)
 
-        return eps, motion_feat_target, motion_feat.detach(), audio_feat_saved.detach()
+        # --- Inner-loop adaptation on the denoising network ---
+        # We want to update the denoising network’s parameters via a differentiable inner loop.
+        # Since the denoising network (DenoisingNetwork) expects an input that is a concatenation of
+        # prev_motion_feat and current motion_feat, its output has shape (batch_size, n_prev_motions+n_motions, d_motion).
+        # Our target for inner-loop loss is the current motion features (motion_feat of shape (batch_size, n_motions, d_motion)).
+        num_inner_steps = 3   # number of inner updates
+        inner_lr = 1e-2       # inner-loop learning rate
 
+       # --- Inside DitTalkingHead.forward, in the inner-loop update block ---
+
+        # with functional_context(self.denoising_net) as f_denoise:
+        #     logger.info("[bold green]Starting inner-loop update for denoising_net functional copy.[/]")
+            
+        #     for step in range(num_inner_steps):
+        #         # Forward pass with current fast parameters
+        #         pred = f_denoise(motion_feat_noisy, audio_feat, 
+        #                         prev_motion_feat, prev_audio_feat, 
+        #                         time_step, indicator)
+                
+        #         # Extract current motion predictions
+        #         pred_current = pred[:, -self.n_motions:, :]
+                
+        #         # Compute loss
+        #         loss_inner = F.mse_loss(pred_current, motion_feat)
+        #         logger.debug(f"Inner loop step {step}: loss = {loss_inner.item():.6f}")
+                
+        #         # Get list of parameters that require gradients
+        #         trainable_params = [p for p in f_denoise.parameters() if p.requires_grad]
+                
+        #         try:
+        #             # First try with allow_unused=False to catch any issues
+        #             grads = torch.autograd.grad(
+        #                 loss_inner,
+        #                 trainable_params,
+        #                 create_graph=True,
+        #                 allow_unused=True  # Changed to True to handle unused parameters
+        #             )
+                    
+        #             # Replace None gradients with zeros
+        #             grads = [torch.zeros_like(p) if g is None else g 
+        #                     for p, g in zip(trainable_params, grads)]
+                    
+        #         except Exception as e:
+        #             logger.error(f"Error during gradient computation: {str(e)}")
+        #             # If gradient computation fails, return zero gradients
+        #             grads = [torch.zeros_like(p) for p in trainable_params]
+                
+        #         # Update fast parameters
+        #         update_fast_params(f_denoise, grads, inner_lr)
+            
+        #     # Final forward pass with adapted parameters
+        #     motion_feat_target = f_denoise(motion_feat_noisy, audio_feat,
+        #                                 prev_motion_feat, prev_audio_feat,
+        #                                 time_step, indicator)
+# In DitTalkingHead's forward method:
+        # In DitTalkingHead's forward method:
+        # In DitTalkingHead's forward method:
+        with functional_context(self.denoising_net) as f_denoise:
+            logger.info("[bold green]Starting inner-loop update for denoising_net functional copy.[/]")
+            try:
+                # Ensure all inputs are on the correct device
+                # motion_feat_noisy = to_device(motion_feat_noisy, "motion_feat_noisy", self.device)
+                # audio_feat = to_device(audio_feat, "audio_feat", self.device)
+                # prev_motion_feat = to_device(prev_motion_feat, "prev_motion_feat", self.device)
+                # prev_audio_feat = to_device(prev_audio_feat, "prev_audio_feat", self.device)
+                # time_step = to_device(time_step, "time_step", self.device)
+                # motion_feat = to_device(motion_feat, "motion_feat", self.device)
+                
+                # Get target from inner loop adaptation
+                motion_feat_target = self.inner_loop_adaptation(
+                    f_denoise=f_denoise,
+                    motion_feat_noisy=motion_feat_noisy,
+                    audio_feat=audio_feat,
+                    prev_motion_feat=prev_motion_feat,
+                    prev_audio_feat=prev_audio_feat,
+                    time_step=time_step,
+                    indicator=indicator,
+                    motion_feat=motion_feat
+                )
+                
+                # Return all required values for training
+                return motion_feat_noisy, motion_feat_target, prev_motion_feat, prev_audio_feat
+                
+            except Exception as e:
+                logger.error(f"Error in forward pass: {str(e)}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                raise
+
+        def to_device(x, name, device):
+            """Helper function to safely convert inputs to tensors on the correct device"""
+            logger.debug(f"Converting {name} of type {type(x)} to tensor on device {device}")
+            if torch.is_tensor(x):
+                return x.to(device)
+            elif isinstance(x, list):
+                return torch.tensor(x, device=device)
+            elif isinstance(x, np.ndarray):
+                return torch.from_numpy(x).to(device)
+            else:
+                logger.error(f"Unexpected type for {name}: {type(x)}")
+                raise TypeError(f"Cannot convert {name} of type {type(x)} to tensor")
+            
     def extract_audio_feature(self, audio, frame_num=None):
         frame_num = frame_num or self.n_motions
 
@@ -627,12 +699,14 @@ class DenoisingNetwork(nn.Module):
     def __init__(self, device='cuda', motion_feat_dim=76, 
                  use_indicator=None, architecture="decoder", feature_dim=512, n_heads=8, 
                  n_layers=8, mlp_ratio=4, align_mask_width=1, no_use_learnable_pe=True, n_prev_motions=10,
-                 n_motions=100, n_diff_steps=500):
+                 n_motions=100, n_diff_steps=500, ):
         super().__init__()
 
         # Model parameters
         self.motion_feat_dim = motion_feat_dim 
         self.use_indicator = use_indicator
+
+        # Transformer
         self.architecture = architecture
         self.feature_dim = feature_dim
         self.n_heads = n_heads
@@ -640,15 +714,12 @@ class DenoisingNetwork(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.align_mask_width = align_mask_width
         self.use_learnable_pe = not no_use_learnable_pe
+
+        # sequence length
         self.n_prev_motions = n_prev_motions
         self.n_motions = n_motions
 
-        # Important: Initialize feature_proj first since it's used in forward
-        if self.architecture == 'decoder':
-            self.feature_proj = nn.Linear(self.motion_feat_dim + (1 if self.use_indicator else 0),
-                                        self.feature_dim)
-
-        # Temporal embedding for diffusion time step
+        # Temporal embedding for the diffusion time step
         self.TE = PositionalEncoding(self.feature_dim, max_len=n_diff_steps + 1)
         self.diff_step_map = nn.Sequential(
             nn.Linear(self.feature_dim, self.feature_dim),
@@ -656,26 +727,26 @@ class DenoisingNetwork(nn.Module):
             nn.Linear(self.feature_dim, self.feature_dim)
         )
 
-        # Positional encoding
         if self.use_learnable_pe:
+            # Learnable positional encoding
             self.PE = nn.Parameter(torch.randn(1, 1 + self.n_prev_motions + self.n_motions, self.feature_dim))
         else:
             self.PE = PositionalEncoding(self.feature_dim)
 
-        # LSH Transformer decoder
+        # Transformer decoder
         if self.architecture == 'decoder':
-            decoder_layer = LSHTransformerDecoderLayer(
-                d_model=self.feature_dim,
-                nhead=self.n_heads,
-                dim_feedforward=self.mlp_ratio * self.feature_dim
+            self.feature_proj = nn.Linear(self.motion_feat_dim + (1 if self.use_indicator else 0),
+                                          self.feature_dim)
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=self.feature_dim, nhead=self.n_heads, dim_feedforward=self.mlp_ratio * self.feature_dim,
+                activation='gelu', batch_first=True
             )
-            self.transformer = LSHTransformerDecoder(decoder_layer, num_layers=self.n_layers)
-            
+            self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=self.n_layers)
             if self.align_mask_width > 0:
                 motion_len = self.n_prev_motions + self.n_motions
-                alignment_mask = enc_dec_mask(motion_len, motion_len, 
-                                           frame_width=1, 
-                                           expansion=self.align_mask_width - 1)
+                alignment_mask = enc_dec_mask(motion_len, motion_len, frame_width=1, expansion=self.align_mask_width - 1)
+                # print(f"alignment_mask: ", alignment_mask.shape)
+                # alignment_mask = F.pad(alignment_mask, (0, 0, 1, 0), value=False)
                 self.register_buffer('alignment_mask', alignment_mask)
             else:
                 self.alignment_mask = None
@@ -687,6 +758,8 @@ class DenoisingNetwork(nn.Module):
             nn.Linear(self.feature_dim, self.feature_dim // 2),
             nn.GELU(),
             nn.Linear(self.feature_dim // 2, self.motion_feat_dim),
+            # nn.Tanh() # 增加了一个tanh
+            # nn.Softmax()
         )
 
         self.to(device)
@@ -696,36 +769,59 @@ class DenoisingNetwork(nn.Module):
         return next(self.parameters()).device
 
     def forward(self, motion_feat, audio_feat, prev_motion_feat, prev_audio_feat, step, indicator=None):
-        # Handle indicator if present
+        """
+        Args:
+            motion_feat: (N, L, d_motion). Noisy motion feature
+            audio_feat: (N, L, feature_dim)
+            prev_motion_feat: (N, L_p, d_motion). Padded previous motion coefficients or feature
+            prev_audio_feat: (N, L_p, d_audio). Padded previous motion coefficients or feature
+            step: (N,)
+            indicator: (N, L). 0/1 indicator for the real (unpadded) motion feature
+
+        Returns:
+            motion_feat_target: (N, L_p + L, d_motion)
+        """
+        # Diffusion time step embedding
+        diff_step_embedding = self.diff_step_map(self.TE.pe[0, step]).unsqueeze(1)  # (N, 1, diff_step_dim)
+
         if indicator is not None:
-            indicator = torch.cat([
-                torch.zeros((indicator.shape[0], self.n_prev_motions), device=indicator.device),
-                indicator
-            ], dim=1).unsqueeze(-1)
+            indicator = torch.cat([torch.zeros((indicator.shape[0], self.n_prev_motions), device=indicator.device),
+                                   indicator], dim=1)  # (N, L_p + L)
+            indicator = indicator.unsqueeze(-1)  # (N, L_p + L, 1)
 
-        # Concat features
-        feats_in = torch.cat([prev_motion_feat, motion_feat], dim=1)
+        # Concat features and embeddings
+        if self.architecture == 'decoder':
+            # print("prev_motion_feat: ", prev_motion_feat.shape, "motion_feat: ", motion_feat.shape)
+            feats_in = torch.cat([prev_motion_feat, motion_feat], dim=1)  # (N, L_p + L, d_motion)
+        else:
+            raise ValueError(f'Unknown architecture: {self.architecture}')
         if self.use_indicator:
-            feats_in = torch.cat([feats_in, indicator], dim=-1)
+            feats_in = torch.cat([feats_in, indicator], dim=-1)  # (N, L_p + L, d_motion + d_audio + 1)
 
-        # Project features
-        feats_in = self.feature_proj(feats_in)
+        feats_in = self.feature_proj(feats_in)  # (N, L_p + L, feature_dim)
+        # feats_in = torch.cat([person_feat, feats_in], dim=1)  # (N, 1 + L_p + L, feature_dim)
 
-        # Add positional and temporal embeddings
-        diff_step_embedding = self.diff_step_map(self.TE.pe[0, step]).unsqueeze(1)
         if self.use_learnable_pe:
+            # feats_in = feats_in + self.PE
             feats_in = feats_in + self.PE + diff_step_embedding
         else:
+            # feats_in = self.PE(feats_in)
             feats_in = self.PE(feats_in) + diff_step_embedding
 
-        # Transformer with LSH attention
-        audio_feat_in = torch.cat([prev_audio_feat, audio_feat], dim=1)
-        feat_out = self.transformer(feats_in, audio_feat_in, memory_mask=self.alignment_mask)
+        # Transformer
+        if self.architecture == 'decoder':
+            audio_feat_in = torch.cat([prev_audio_feat, audio_feat], dim=1)  # (N, L_p + L, d_audio)
+            # print(f"feats_in: {feats_in.shape}, audio_feat_in: {audio_feat_in.shape}, memory_mask: {self.alignment_mask.shape}")
+            feat_out = self.transformer(feats_in, audio_feat_in, memory_mask=self.alignment_mask)
+        else:
+            raise ValueError(f'Unknown architecture: {self.architecture}')
 
-        # Decode motion features
-        motion_feat_target = self.motion_dec(feat_out)
+        # Decode predicted motion feature noise / sample
+        # motion_feat_target = self.motion_dec(feat_out[:, 1:])  # (N, L_p + L, d_motion)
+        motion_feat_target = self.motion_dec(feat_out)  # (N, L_p + L, d_motion)
 
         return motion_feat_target
+
 if __name__ == "__main__":
     device = "cuda"
     motion_feat_dim = 76

@@ -126,8 +126,8 @@ def train(args, model, train_loader, val_loader, optimizer, save_dir, scheduler=
             else:
                 noise, target, _, _ = model(motion_coef_in, audio_in, prev_motion_coef, prev_audio_feat, indicator=indicator)
 
-
-            # visualize_expression_comparison(target, noise, iteration=it)
+            if it % 50 == 0:
+                visualize_expression_comparison(target, noise, iteration=it)
             # visualize_expression_sequence_comparison(target, noise, n_frames=5, iteration=it)
       
             loss_n, loss_exp, loss_exp_v, loss_exp_s, loss_ha, loss_hc, loss_hs, loss_ht = utils.compute_loss_new(args, i == 0, motion_coef_in, noise, target, prev_motion_coef, end_idx)
